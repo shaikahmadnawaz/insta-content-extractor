@@ -7,7 +7,7 @@ A Python CLI tool to extract content from Instagram posts, including carousel sl
 - Post metadata: owner, timestamps, likes, comments, post type
 - Caption content: full caption, hashtags, mentions
 - Media assets: all image/video URLs plus optional local downloads
-- OCR content: text detected on each image slide, with confidence and a combined text file
+- OCR content: text detected on each image slide and timestamped text scenes from reels/videos
 - Accessibility caption: Instagram's own alt/accessibility text when available
 
 ## Setup
@@ -16,10 +16,11 @@ A Python CLI tool to extract content from Instagram posts, including carousel sl
 pip install -r requirements.txt
 ```
 
-If you want OCR, install Tesseract too:
+If you want OCR, install Tesseract and ffmpeg:
 
 ```bash
 brew install tesseract
+brew install ffmpeg
 ```
 
 ## Usage
@@ -27,6 +28,9 @@ brew install tesseract
 ```bash
 # Extract metadata + media
 python main.py "https://www.instagram.com/p/DVVXez5Ctc3/"
+
+# Extract a reel
+python main.py "https://www.instagram.com/reel/DTTBJSgE6pP/"
 
 # Extract metadata + OCR from all image slides
 # This creates one OCR text file
@@ -59,17 +63,48 @@ Output rules:
 - `--json`: saves one `.json` file
 - `--ocr --json`: saves both the OCR `.txt` file and the `.json` file
 
+For reels/videos, OCR output is grouped by timestamp in playback order:
+
+```text
+00:00
+Extracted text
+
+00:03
+Next scene text
+```
+
 The JSON now includes:
 
 - `media`: raw media items from Instagram
 - `slides`: per-slide objects with `file_path` and OCR results
-- `ocr_text`: OCR result objects with `text`, `lines`, `confidence`, `variant`, `media_type`, `ocr_source`
+- `ocr_text`: OCR result objects with `slide`, `media_type`, `timestamp`, `text`, `lines`, `confidence`, `variant`, `ocr_source`
 - `ocr_combined_text`: one merged text blob for downstream use
+
+URL behavior:
+
+- The saved `url` field preserves the original Instagram media type: `/p/`, `/reel/`, or `/tv/`
+- Reel and TV links are not rewritten to `/p/` in JSON output
+
+Cached media behavior:
+
+- Image cache entries are verified as real images before reuse
+- Video cache entries are checked for a valid MP4 signature before reuse
+- If `ffprobe` is available, cached videos are also validated for a real video stream and positive duration
+
+## Testing
+
+Run the test suite with either of these commands:
+
+```bash
+python3 -m unittest -v
+./.venv/bin/python -m unittest discover -s tests -v
+```
 
 ## Notes
 
 - Works best for public posts
 - Supports `/p/`, `/reel/`, and `/tv/` URLs
 - Instagram may intermittently return `403` or rate-limit anonymous requests
-- Video OCR uses the post's cover/thumbnail image
+- Reel/video OCR samples frames from downloaded video (default every `1s`, and `0.5s` for short reels), then deduplicates repeated scenes
+- If frame OCR fails for a video slide, OCR falls back to the thumbnail image
 - OCR is strongest on text-heavy slides like educational carousels and weaker on stylized or low-contrast imagery

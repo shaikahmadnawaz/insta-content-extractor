@@ -116,20 +116,53 @@ def display_results(data: dict, show_json: bool = False) -> None:
     # OCR Results
     if data.get("ocr_text"):
         console.print()
+        video_blocks: dict[int, list[dict]] = {}
         for ocr_item in data["ocr_text"]:
+            if ocr_item.get("media_type") == "video":
+                video_blocks.setdefault(ocr_item["slide"], []).append(ocr_item)
+                continue
+
             slide = ocr_item["slide"]
             text = ocr_item["text"]
             confidence = ocr_item.get("confidence", 0.0)
             if text and not text.startswith("[OCR failed"):
                 console.print(
-                    Panel(text, title=f"Slide {slide} - OCR Text ({confidence:.1f}%)",
-                          title_align="left", border_style="bright_yellow",
-                          box=box.ROUNDED)
+                    Panel(
+                        text,
+                        title=f"Slide {slide} - OCR Text ({confidence:.1f}%)",
+                        title_align="left",
+                        border_style="bright_yellow",
+                        box=box.ROUNDED,
+                    )
                 )
             elif text.startswith("[OCR failed"):
                 console.print(f"  [dim]Slide {slide}: {text}[/dim]")
             else:
                 console.print(f"  [dim]Slide {slide}: (no text detected)[/dim]")
+
+        for slide in sorted(video_blocks):
+            scenes = sorted(video_blocks[slide], key=lambda item: item.get("timestamp") or "")
+            readable_scenes = []
+            for scene in scenes:
+                text = scene.get("text", "")
+                if not text or text.startswith("[OCR failed"):
+                    continue
+                timestamp = scene.get("timestamp") or "00:00"
+                readable_scenes.append(f"{timestamp}\n{text}")
+
+            if readable_scenes:
+                body = "\n\n".join(readable_scenes)
+                console.print(
+                    Panel(
+                        body,
+                        title=f"Slide {slide} - Reel OCR Scenes",
+                        title_align="left",
+                        border_style="bright_yellow",
+                        box=box.ROUNDED,
+                    )
+                )
+            else:
+                console.print(f"  [dim]Slide {slide}: (no text detected in video scenes)[/dim]")
 
     # Output Summary
     console.print()

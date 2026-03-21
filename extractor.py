@@ -14,7 +14,11 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
+from difflib import SequenceMatcher
 from io import BytesIO
 from urllib.parse import urlparse
 
@@ -28,6 +32,12 @@ DEFAULT_OCR_LANG = "eng"
 DEFAULT_OCR_PSM = 6
 DEFAULT_OCR_MIN_CONFIDENCE = 30.0
 DEFAULT_FETCH_ATTEMPTS = 3
+DEFAULT_VIDEO_FRAME_INTERVAL_SECONDS = 1.0
+SHORT_VIDEO_FRAME_INTERVAL_SECONDS = 0.5
+SHORT_VIDEO_DURATION_THRESHOLD_SECONDS = 15.0
+SCENE_SIMILARITY_THRESHOLD = 0.9
+MIN_SCENE_CONFIDENCE = 60.0
+MIN_SCENE_MEANINGFUL_TOKENS = 4
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -37,16 +47,28 @@ REQUEST_HEADERS = {
 }
 
 
-def extract_shortcode(url: str) -> str:
-    """Extract the shortcode from an Instagram post URL."""
+def _extract_instagram_url_parts(url: str) -> tuple[str, str]:
+    """Extract the Instagram media kind and shortcode from a supported URL."""
     path = urlparse(url).path.strip("/")
-    match = re.match(r"(?:p|reel|tv)/([A-Za-z0-9_-]+)", path)
+    match = re.match(r"(?P<kind>p|reel|tv)/(?P<shortcode>[A-Za-z0-9_-]+)", path)
     if match:
-        return match.group(1)
+        return match.group("kind"), match.group("shortcode")
     raise ValueError(
         f"Could not extract shortcode from URL: {url}\n"
-        "Expected: https://www.instagram.com/p/SHORTCODE/"
+        "Expected: https://www.instagram.com/p/SHORTCODE/ "
+        "or /reel/SHORTCODE/ or /tv/SHORTCODE/"
     )
+
+
+def extract_shortcode(url: str) -> str:
+    """Extract the shortcode from an Instagram post URL."""
+    _, shortcode = _extract_instagram_url_parts(url)
+    return shortcode
+
+
+def _build_canonical_instagram_url(kind: str, shortcode: str) -> str:
+    """Return a canonical Instagram URL for the detected media type."""
+    return f"https://www.instagram.com/{kind}/{shortcode}/"
 
 
 def extract_post(
@@ -60,7 +82,7 @@ def extract_post(
     ocr_min_confidence: float = DEFAULT_OCR_MIN_CONFIDENCE,
 ) -> dict:
     """Extract all content from a public Instagram post."""
-    shortcode = extract_shortcode(url)
+    url_kind, shortcode = _extract_instagram_url_parts(url)
     post_output_dir = _build_post_output_dir(output_dir, shortcode)
     loader = _create_loader()
     post = _fetch_post(loader, shortcode)
@@ -74,6 +96,8 @@ def extract_post(
     ocr_results: list[dict] = []
     if ocr:
         _ensure_tesseract_available()
+        if any(slide["type"] == "video" for slide in slides):
+            _ensure_ffmpeg_available()
         ocr_results = _ocr_images(
             slides=slides,
             ocr_lang=ocr_lang,
@@ -84,7 +108,7 @@ def extract_post(
 
     post_data = {
         "shortcode": shortcode,
-        "url": f"https://www.instagram.com/p/{shortcode}/",
+        "url": _build_canonical_instagram_url(url_kind, shortcode),
         "post_type": _get_post_type(post),
         "owner": {
             "username": post.owner_username,
@@ -257,7 +281,52 @@ def _is_valid_cached_media(item: dict, filepath: str) -> bool:
         except Exception:
             return False
 
-    return os.path.getsize(filepath) >= 1024
+    return _is_valid_video_file(filepath)
+
+
+def _is_valid_video_file(filepath: str) -> bool:
+    """Validate a cached video using MP4 signature checks and ffprobe when available."""
+    if os.path.getsize(filepath) < 1024:
+        return False
+
+    try:
+        with open(filepath, "rb") as file_obj:
+            header = file_obj.read(64)
+    except OSError:
+        return False
+
+    if b"ftyp" not in header:
+        return False
+
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffprobe_path:
+        return True
+
+    command = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_entries",
+        "format=duration:stream=codec_type",
+        filepath,
+    ]
+    try:
+        proc = subprocess.run(command, check=True, capture_output=True, text=True)
+        probe_data = json.loads(proc.stdout or "{}")
+    except (subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+        return False
+
+    duration = probe_data.get("format", {}).get("duration")
+    try:
+        duration_seconds = float(duration)
+    except (TypeError, ValueError):
+        return False
+
+    streams = probe_data.get("streams", [])
+    has_video_stream = any(stream.get("codec_type") == "video" for stream in streams)
+    return duration_seconds > 0 and has_video_stream
 
 
 def _remove_invalid_cached_file(filepath: str) -> None:
@@ -280,6 +349,16 @@ def _ensure_tesseract_available() -> None:
         ) from exc
 
 
+def _ensure_ffmpeg_available() -> None:
+    """Raise a clear error if ffmpeg is not available for reel OCR."""
+    if shutil.which("ffmpeg"):
+        return
+    raise RuntimeError(
+        "ffmpeg is required for reel OCR but was not found in PATH. "
+        "Install it first, for example with `brew install ffmpeg`."
+    )
+
+
 def _ocr_images(
     slides: list[dict],
     ocr_lang: str,
@@ -292,26 +371,37 @@ def _ocr_images(
     for slide in slides:
         index = slide["index"]
         try:
-            image, media_source = _load_ocr_image(slide)
-            result = _run_best_ocr(
-                image=image,
-                lang=ocr_lang,
-                psm=ocr_psm,
-                min_confidence=ocr_min_confidence,
-            )
-            results.append(
-                {
-                    "slide": index,
-                    "text": result["text"],
-                    "lines": result["lines"],
-                    "confidence": result["confidence"],
-                    "word_count": result["word_count"],
-                    "line_count": result["line_count"],
-                    "variant": result["variant"],
-                    "media_type": slide["type"],
-                    "ocr_source": media_source,
-                }
-            )
+            if slide["type"] == "video":
+                results.extend(
+                    _ocr_video_slide(
+                        slide=slide,
+                        ocr_lang=ocr_lang,
+                        ocr_psm=ocr_psm,
+                        ocr_min_confidence=ocr_min_confidence,
+                    )
+                )
+            else:
+                image, media_source = _load_ocr_image(slide)
+                result = _run_best_ocr(
+                    image=image,
+                    lang=ocr_lang,
+                    psm=ocr_psm,
+                    min_confidence=ocr_min_confidence,
+                )
+                results.append(
+                    {
+                        "slide": index,
+                        "text": result["text"],
+                        "lines": result["lines"],
+                        "confidence": result["confidence"],
+                        "word_count": result["word_count"],
+                        "line_count": result["line_count"],
+                        "variant": result["variant"],
+                        "media_type": slide["type"],
+                        "timestamp": None,
+                        "ocr_source": media_source,
+                    }
+                )
         except Exception as exc:
             results.append(
                 {
@@ -323,6 +413,7 @@ def _ocr_images(
                     "line_count": 0,
                     "variant": "failed",
                     "media_type": slide["type"],
+                    "timestamp": None,
                     "ocr_source": "failed",
                 }
             )
@@ -332,10 +423,21 @@ def _ocr_images(
 
 def _attach_ocr_results(slides: list[dict], ocr_results: list[dict]) -> None:
     """Attach OCR output directly onto slide objects."""
-    by_slide = {item["slide"]: item for item in ocr_results}
+    by_slide: dict[int, list[dict]] = {}
+    for item in ocr_results:
+        by_slide.setdefault(item["slide"], []).append(item)
+
     for slide in slides:
-        if slide["type"] in {"image", "video"}:
-            slide["ocr"] = by_slide.get(slide["index"])
+        if slide["type"] not in {"image", "video"}:
+            continue
+
+        entries = by_slide.get(slide["index"], [])
+        if slide["type"] == "video":
+            slide["ocr_scenes"] = entries
+            slide["ocr"] = entries[0] if entries else None
+            continue
+
+        slide["ocr"] = entries[0] if entries else None
 
 
 def _combine_ocr_text(ocr_results: list[dict]) -> str:
@@ -345,8 +447,277 @@ def _combine_ocr_text(ocr_results: list[dict]) -> str:
         text = item["text"].strip()
         if not text or text.startswith("[OCR failed"):
             continue
+        if item.get("media_type") == "video" and item.get("timestamp"):
+            sections.append(f"{item['timestamp']}\n{text}")
+            continue
         sections.append(f"Slide {item['slide']}\n{text}")
     return "\n\n".join(sections)
+
+
+def _ocr_video_slide(
+    slide: dict,
+    ocr_lang: str,
+    ocr_psm: int,
+    ocr_min_confidence: float,
+) -> list[dict]:
+    """Extract OCR scenes from video frames with thumbnail fallback."""
+    video_path = slide.get("file_path")
+    if video_path and os.path.exists(video_path):
+        try:
+            frame_records = _extract_video_frames_for_ocr(video_path)
+            scene_records = _ocr_video_frames(
+                slide_index=slide["index"],
+                frame_records=frame_records,
+                lang=ocr_lang,
+                psm=ocr_psm,
+                min_confidence=ocr_min_confidence,
+            )
+            if scene_records:
+                return scene_records
+        except Exception as exc:
+            print(f"  Warning: Video frame OCR failed on slide #{slide['index']}: {exc}")
+
+    return [_run_thumbnail_ocr(slide, ocr_lang, ocr_psm, ocr_min_confidence)]
+
+
+def _run_thumbnail_ocr(
+    slide: dict,
+    ocr_lang: str,
+    ocr_psm: int,
+    ocr_min_confidence: float,
+) -> dict:
+    """Run OCR against video thumbnail as fallback when frame OCR is unavailable."""
+    image, media_source = _load_ocr_image(slide)
+    result = _run_best_ocr(
+        image=image,
+        lang=ocr_lang,
+        psm=ocr_psm,
+        min_confidence=ocr_min_confidence,
+    )
+    return {
+        "slide": slide["index"],
+        "text": result["text"],
+        "lines": result["lines"],
+        "confidence": result["confidence"],
+        "word_count": result["word_count"],
+        "line_count": result["line_count"],
+        "variant": result["variant"],
+        "media_type": slide["type"],
+        "timestamp": "00:00",
+        "ocr_source": f"thumbnail_fallback:{media_source}",
+    }
+
+
+def _extract_video_frames_for_ocr(video_path: str) -> list[dict]:
+    """Extract sampled frame files and timestamps from a local video using ffmpeg."""
+    if not os.path.exists(video_path):
+        raise RuntimeError(f"Video file not found: {video_path}")
+
+    interval_seconds = _select_video_frame_interval(video_path)
+    with tempfile.TemporaryDirectory(prefix="ocr_frames_") as temp_dir:
+        frame_pattern = os.path.join(temp_dir, "frame_%06d.jpg")
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            video_path,
+            "-vf",
+            f"fps=1/{interval_seconds}",
+            "-q:v",
+            "2",
+            frame_pattern,
+        ]
+        subprocess.run(command, check=True, capture_output=True, text=True)
+
+        frame_paths = sorted(
+            os.path.join(temp_dir, name)
+            for name in os.listdir(temp_dir)
+            if name.lower().endswith(".jpg")
+        )
+        if not frame_paths:
+            raise RuntimeError("No frames were extracted from the video")
+
+        records = []
+        for idx, frame_path in enumerate(frame_paths):
+            with Image.open(frame_path) as frame_image:
+                records.append(
+                    {
+                        "timestamp_seconds": idx * interval_seconds,
+                        "image": frame_image.copy(),
+                    }
+                )
+        return records
+
+
+def _select_video_frame_interval(video_path: str) -> float:
+    """Use denser sampling for short videos when duration can be determined."""
+    duration_seconds = _probe_video_duration_seconds(video_path)
+    if duration_seconds and duration_seconds <= SHORT_VIDEO_DURATION_THRESHOLD_SECONDS:
+        return SHORT_VIDEO_FRAME_INTERVAL_SECONDS
+    return DEFAULT_VIDEO_FRAME_INTERVAL_SECONDS
+
+
+def _probe_video_duration_seconds(video_path: str) -> float | None:
+    """Read video duration via ffprobe when available."""
+    if not shutil.which("ffprobe"):
+        return None
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        proc = subprocess.run(command, check=True, capture_output=True, text=True)
+        return float(proc.stdout.strip())
+    except (subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _ocr_video_frames(
+    slide_index: int,
+    frame_records: list[dict],
+    lang: str,
+    psm: int,
+    min_confidence: float,
+) -> list[dict]:
+    """Run OCR over sampled video frames and return deduplicated scene records."""
+    scene_candidates = []
+    for frame_record in frame_records:
+        result = _run_best_ocr(
+            image=frame_record["image"],
+            lang=lang,
+            psm=psm,
+            min_confidence=min_confidence,
+        )
+        text = result["text"].strip()
+        if not text:
+            continue
+        if not _should_keep_video_scene(result):
+            continue
+        scene_candidates.append(
+            {
+                "slide": slide_index,
+                "media_type": "video",
+                "timestamp": _format_seconds_timestamp(frame_record["timestamp_seconds"]),
+                "timestamp_seconds": frame_record["timestamp_seconds"],
+                "text": text,
+                "lines": result["lines"],
+                "confidence": result["confidence"],
+                "word_count": result["word_count"],
+                "line_count": result["line_count"],
+                "variant": result["variant"],
+                "ocr_source": "video_frame",
+            }
+        )
+
+    collapsed = _collapse_scene_candidates_by_second(scene_candidates)
+    return _deduplicate_scene_records(collapsed)
+
+
+def _should_keep_video_scene(result: dict) -> bool:
+    """Filter out low-quality OCR scenes that are mostly noise."""
+    text = result.get("text", "")
+    if not text.strip():
+        return False
+
+    confidence = float(result.get("confidence", 0.0))
+    words = re.findall(r"[A-Za-z]{3,}", text)
+    meaningful_tokens = [token for token in words if re.search(r"[aeiou]", token.lower())]
+    average_token_length = (
+        sum(len(token) for token in meaningful_tokens) / len(meaningful_tokens)
+        if meaningful_tokens
+        else 0.0
+    )
+
+    alnum_chars = sum(1 for char in text if char.isalnum())
+    letter_chars = sum(1 for char in text if char.isalpha())
+    alpha_ratio = (letter_chars / alnum_chars) if alnum_chars else 0.0
+
+    if confidence < MIN_SCENE_CONFIDENCE and len(meaningful_tokens) < MIN_SCENE_MEANINGFUL_TOKENS:
+        return False
+    if len(meaningful_tokens) < 2 and len(text.strip()) < 24:
+        return False
+    if confidence < 82.0 and len(meaningful_tokens) < 3:
+        return False
+    if confidence < 82.0 and average_token_length < 4.0:
+        return False
+    if alpha_ratio < 0.4 and confidence < 75.0:
+        return False
+    return True
+
+
+def _collapse_scene_candidates_by_second(scene_candidates: list[dict]) -> list[dict]:
+    """Keep one strongest OCR scene per second to reduce rapid-frame duplicates."""
+    best_by_second: dict[int, dict] = {}
+
+    for scene in scene_candidates:
+        second_key = int(scene.get("timestamp_seconds", 0.0))
+        existing = best_by_second.get(second_key)
+        if existing is None or _scene_quality_score(scene) > _scene_quality_score(existing):
+            best_by_second[second_key] = scene
+
+    return [best_by_second[second] for second in sorted(best_by_second)]
+
+
+def _scene_quality_score(scene: dict) -> float:
+    """Prefer scenes with confident OCR and richer text content."""
+    confidence = float(scene.get("confidence", 0.0))
+    word_count = int(scene.get("word_count", 0))
+    return confidence * math.log(word_count + 2, 2)
+
+
+def _deduplicate_scene_records(scene_records: list[dict]) -> list[dict]:
+    """Deduplicate repeated OCR scenes and keep first appearance timestamp."""
+    kept: list[dict] = []
+    normalized_history: list[str] = []
+
+    for scene in sorted(scene_records, key=lambda item: item.get("timestamp_seconds", 0.0)):
+        normalized = _normalize_scene_text(scene.get("text", ""))
+        if not normalized:
+            continue
+
+        if any(_texts_are_similar(normalized, seen) for seen in normalized_history):
+            continue
+
+        normalized_history.append(normalized)
+        cleaned = dict(scene)
+        cleaned.pop("timestamp_seconds", None)
+        kept.append(cleaned)
+
+    return kept
+
+
+def _normalize_scene_text(text: str) -> str:
+    """Normalize OCR scene text for reliable deduplication."""
+    compact = re.sub(r"\s+", " ", text).strip().lower()
+    compact = re.sub(r"[^\w\s]", "", compact)
+    return compact
+
+
+def _texts_are_similar(text_a: str, text_b: str) -> bool:
+    """Compare normalized texts with a high similarity threshold."""
+    if text_a == text_b:
+        return True
+    if not text_a or not text_b:
+        return False
+    return SequenceMatcher(None, text_a, text_b).ratio() >= SCENE_SIMILARITY_THRESHOLD
+
+
+def _format_seconds_timestamp(seconds: float) -> str:
+    """Format seconds into MM:SS for OCR scene headers."""
+    total_seconds = max(0, int(seconds))
+    minutes = total_seconds // 60
+    remainder = total_seconds % 60
+    return f"{minutes:02d}:{remainder:02d}"
 
 
 def _load_ocr_image(slide: dict) -> tuple[Image.Image, str]:
