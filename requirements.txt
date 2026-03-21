@@ -1,0 +1,5 @@
+instaloader>=4.13
+rich>=13.0
+pytesseract>=0.3.10
+Pillow>=10.0
+requests>=2.32.0

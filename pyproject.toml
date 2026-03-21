@@ -1,7 +1,13 @@
 [project]
 name = "insta-content-extractor"
 version = "0.1.0"
-description = "Add your description here"
+description = "CLI tool to extract Instagram post metadata, media, and OCR text"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.9"
+dependencies = [
+    "instaloader>=4.15",
+    "pillow>=12.1.1",
+    "pytesseract>=0.3.13",
+    "requests>=2.32.0",
+    "rich>=14.3.3",
+]
