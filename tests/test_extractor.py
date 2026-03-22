@@ -9,16 +9,23 @@ from PIL import Image
 
 from extractor import (
     _build_canonical_instagram_url,
+    _clean_video_scene_records_with_sarvam,
     _deduplicate_scene_records,
     _ensure_ffmpeg_available,
     _extract_instagram_url_parts,
     _format_seconds_timestamp,
+    _get_sarvam_message_content,
+    _get_env_value,
     _build_post_output_dir,
     _combine_ocr_text,
     _get_ocr_image_url,
     _is_valid_cached_media,
+    _looks_like_model_reasoning,
+    _looks_like_marketing_endcard,
+    _normalize_scene_text_for_output,
     _normalize_ocr_line,
     _ocr_video_slide,
+    _resolve_sarvam_chat_model,
     _should_keep_video_scene,
     extract_post,
     extract_shortcode,
@@ -44,6 +51,80 @@ class ExtractorTests(unittest.TestCase):
         self.assertEqual(
             _build_canonical_instagram_url("tv", "ABC123"),
             "https://www.instagram.com/tv/ABC123/",
+        )
+
+    def test_get_env_value_reads_from_dotenv_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = os.path.join(temp_dir, ".env")
+            with open(env_path, "w", encoding="utf-8") as file_obj:
+                file_obj.write('SARVAM_API_KEY="abc123"\n')
+
+            self.assertEqual(_get_env_value("SARVAM_API_KEY", env_path=env_path), "abc123")
+
+    def test_get_sarvam_message_content_ignores_reasoning_content(self) -> None:
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        reasoning_content="cleaned text",
+                    )
+                )
+            ]
+        )
+        self.assertEqual(_get_sarvam_message_content(response), "")
+
+    def test_looks_like_model_reasoning_detects_prompt_reflection(self) -> None:
+        self.assertTrue(
+            _looks_like_model_reasoning(
+                "1. **Analyze the user's request:**\n* Constraints:\n* Return only the cleaned text"
+            )
+        )
+
+    def test_normalize_scene_text_for_output_removes_common_ocr_prefix_noise(self) -> None:
+        text = (
+            "= DevOps Foundations\n"
+            "e Linux:\n"
+            "o files, permissions, processes, services\n"
+            "¢ Monitoring:\n"
+            "e laC: AN ¢\n"
+            "© Goal: Automate build > test > deploy > scalé\n"
+            "JY Cloud infra with Terraform\n"
+            "o—____\n"
+            "Maven/npm/ pip\n"
+            "/ | |\n"
+        )
+        self.assertEqual(
+            _normalize_scene_text_for_output(text),
+            (
+                "DevOps Foundations\n"
+                "Linux:\n"
+                "files, permissions, processes, services\n"
+                "Monitoring:\n"
+                "laC: AN\n"
+                "Goal: Automate build > test > deploy > scale\n"
+                "JY Cloud infra with Terraform\n"
+                "Maven/npm/pip"
+            ),
+        )
+
+    def test_looks_like_marketing_endcard_detects_noisy_course_card(self) -> None:
+        self.assertTrue(
+            _looks_like_marketing_endcard(
+                "Complete Tutorial\nFull Course\nDocker compose\nGitHub Actions\nESLint\nPrettier\nExtra line\nAnother line\nMore"
+            )
+        )
+
+    def test_resolve_sarvam_chat_model_prefers_30b_for_images(self) -> None:
+        self.assertEqual(
+            _resolve_sarvam_chat_model("auto", [{"type": "image"}]),
+            "sarvam-30b",
+        )
+
+    def test_resolve_sarvam_chat_model_defaults_to_30b_for_videos(self) -> None:
+        self.assertEqual(
+            _resolve_sarvam_chat_model("auto", [{"type": "video"}]),
+            "sarvam-30b",
         )
 
     def test_normalize_ocr_line_collapses_whitespace(self) -> None:
@@ -285,6 +366,99 @@ class ExtractorTests(unittest.TestCase):
             )
 
         self.assertEqual(data["url"], "https://www.instagram.com/reel/DTTBJSgE6pP/")
+
+    @patch("extractor._fetch_post")
+    @patch("extractor._create_loader")
+    @patch("extractor._ocr_images_with_sarvam")
+    def test_extract_post_uses_sarvam_provider_when_requested(
+        self,
+        mock_sarvam_ocr,
+        _,
+        mock_fetch_post,
+    ) -> None:
+        mock_fetch_post.return_value = SimpleNamespace(
+            typename="GraphImage",
+            is_video=False,
+            owner_username="creator",
+            owner_id="123",
+            caption="caption",
+            accessibility_caption=None,
+            caption_hashtags=(),
+            caption_mentions=(),
+            date_utc=datetime(2026, 1, 9, 16, 48, 26, tzinfo=timezone.utc),
+            date_local=datetime(2026, 1, 9, 22, 18, 26, tzinfo=timezone.utc),
+            likes=42,
+            comments=5,
+            url="https://cdn.example/image.jpg",
+        )
+        mock_sarvam_ocr.return_value = (
+            [
+                {
+                    "slide": 1,
+                    "text": "clean text",
+                    "lines": ["clean text"],
+                    "confidence": 0.0,
+                    "word_count": 2,
+                    "line_count": 1,
+                    "variant": "sarvam_vision",
+                    "media_type": "image",
+                    "timestamp": None,
+                    "ocr_source": "sarvam_vision+sarvam-30b",
+                }
+            ],
+            "sarvam-30b",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data = extract_post(
+                "https://www.instagram.com/p/DVVXez5Ctc3/",
+                download_media=False,
+                output_dir=temp_dir,
+                ocr=True,
+                ocr_provider="sarvam",
+            )
+
+        self.assertEqual(data["ocr_provider"], "sarvam")
+        self.assertEqual(data["ocr_cleanup_model"], "sarvam-30b")
+        mock_sarvam_ocr.assert_called_once()
+
+    def test_clean_video_scene_records_with_sarvam_drops_noise(self) -> None:
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=lambda **_: SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content="DevOps Roadmap",
+                            )
+                        )
+                    ]
+                )
+            )
+        )
+        scene_candidates = [
+            {
+                "slide": 1,
+                "timestamp": "00:04",
+                "timestamp_seconds": 4.0,
+                "text": "DevOps Roadmap",
+            },
+            {
+                "slide": 1,
+                "timestamp": "00:08",
+                "timestamp_seconds": 8.0,
+                "text": "noisy thumb",
+            },
+        ]
+
+        cleaned = _clean_video_scene_records_with_sarvam(
+            client=client,
+            cleanup_model="sarvam-30b",
+            scene_candidates=[scene_candidates[0]],
+        )
+
+        self.assertEqual(len(cleaned), 1)
+        self.assertEqual(cleaned[0]["text"], "DevOps Roadmap")
 
 
 if __name__ == "__main__":
