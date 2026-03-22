@@ -23,7 +23,7 @@ brew install tesseract
 brew install ffmpeg
 ```
 
-If you want Sarvam-powered OCR and cleanup, install the SDK and export your API key:
+If you want Sarvam-powered cleanup on top of local OCR, install the SDK and export your API key:
 
 ```bash
 uv pip install --python .venv/bin/python sarvamai
@@ -39,21 +39,27 @@ python main.py "https://www.instagram.com/p/DVVXez5Ctc3/"
 # Extract a reel
 python main.py "https://www.instagram.com/reel/DTTBJSgE6pP/"
 
-# Extract metadata + OCR from all image slides
+# Extract metadata + local Tesseract OCR from all image slides
 # This creates one OCR text file
-python main.py "https://www.instagram.com/p/DVVXez5Ctc3/" --ocr
+python main.py "https://www.instagram.com/p/DVVXez5Ctc3/" --local
 
-# Extract using Sarvam Vision OCR + Sarvam chat cleanup
+# Extract using local Tesseract OCR + Sarvam 30b cleanup
 python main.py "https://www.instagram.com/reel/DTTBJSgE6pP/" --sarvam
 
-# Force the higher-quality cleanup model for difficult reels
-python main.py "https://www.instagram.com/reel/DTTBJSgE6pP/" --sarvam --sarvam-model sarvam-105b
+# Extract using Sarvam Vision OCR + Sarvam 30b cleanup
+python main.py "https://www.instagram.com/p/DVVXez5Ctc3/" --sarvam-vision
 
-# OCR with custom tuning
-python main.py "https://www.instagram.com/p/DVVXez5Ctc3/" --ocr --ocr-psm 6 --ocr-min-confidence 35
+# Extract a reel with Sarvam Vision OCR + Sarvam 30b cleanup
+python main.py "https://www.instagram.com/reel/DTTBJSgE6pP/" --sarvam-vision
+
+# Force the higher-quality cleanup model for difficult reels
+python main.py "https://www.instagram.com/reel/DTTBJSgE6pP/" --sarvam-vision --sarvam-model sarvam-105b
+
+# Local OCR with custom tuning
+python main.py "https://www.instagram.com/p/DVVXez5Ctc3/" --local --ocr-psm 6 --ocr-min-confidence 35
 
 # Save JSON too
-python main.py "https://www.instagram.com/p/DVVXez5Ctc3/" --ocr --json
+python main.py "https://www.instagram.com/p/DVVXez5Ctc3/" --local --json
 ```
 
 ## Output
@@ -63,18 +69,22 @@ The tool creates a folder per Instagram post inside the base output directory:
 ```text
 downloads/
   DVVXez5Ctc3/
-    DVVXez5Ctc3_1.jpg
-    DVVXez5Ctc3_2.jpg
-    DVVXez5Ctc3.ocr.txt
-    DVVXez5Ctc3.json
+    media/
+      DVVXez5Ctc3_1.jpg
+      DVVXez5Ctc3_2.jpg
+    content/
+      DVVXez5Ctc3.local.ocr.txt
+      DVVXez5Ctc3.local.json
 ```
 
 Output rules:
 
-- Default run: downloads media into the post folder
-- `--ocr`: downloads media plus one combined OCR `.txt` file
-- `--json`: saves one `.json` file
-- `--ocr --json`: saves both the OCR `.txt` file and the `.json` file
+- Downloaded media assets are saved under `<shortcode>/media/`
+- OCR and JSON artifacts are saved under `<shortcode>/content/`
+- `--local`: saves mode-aware files like `content/<shortcode>.local.ocr.txt` and `content/<shortcode>.local.json`
+- `--sarvam`: saves mode-aware files like `content/<shortcode>.sarvam.ocr.txt` and `content/<shortcode>.sarvam.json`
+- `--sarvam-vision`: saves mode-aware files like `content/<shortcode>.sarvam-vision.ocr.txt` and `content/<shortcode>.sarvam-vision.json`
+- `--json` without OCR still saves `content/<shortcode>.json`
 
 For reels/videos, OCR output is grouped by timestamp in playback order:
 
@@ -106,7 +116,7 @@ Cached media behavior:
 
 Sarvam OCR behavior:
 
-- `--sarvam` uses Sarvam Vision for OCR and a Sarvam chat model for cleanup
+- `--sarvam` uses local OCR first and then a Sarvam chat model for cleanup
 - Model selection is automatic by default: `sarvam-30b` for image/carousel cleanup and `sarvam-105b` for reels/videos
 - You can override cleanup selection with `--sarvam-model sarvam-30b` or `--sarvam-model sarvam-105b`
 
