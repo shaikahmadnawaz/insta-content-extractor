@@ -23,6 +23,13 @@ brew install tesseract
 brew install ffmpeg
 ```
 
+If you want Sarvam-powered OCR and cleanup, install the SDK and export your API key:
+
+```bash
+uv pip install --python .venv/bin/python sarvamai
+export SARVAM_API_KEY="your-key-here"
+```
+
 ## Usage
 
 ```bash
@@ -35,6 +42,12 @@ python main.py "https://www.instagram.com/reel/DTTBJSgE6pP/"
 # Extract metadata + OCR from all image slides
 # This creates one OCR text file
 python main.py "https://www.instagram.com/p/DVVXez5Ctc3/" --ocr
+
+# Extract using Sarvam Vision OCR + Sarvam chat cleanup
+python main.py "https://www.instagram.com/reel/DTTBJSgE6pP/" --sarvam
+
+# Force the higher-quality cleanup model for difficult reels
+python main.py "https://www.instagram.com/reel/DTTBJSgE6pP/" --sarvam --sarvam-model sarvam-105b
 
 # OCR with custom tuning
 python main.py "https://www.instagram.com/p/DVVXez5Ctc3/" --ocr --ocr-psm 6 --ocr-min-confidence 35
@@ -90,6 +103,12 @@ Cached media behavior:
 - Image cache entries are verified as real images before reuse
 - Video cache entries are checked for a valid MP4 signature before reuse
 - If `ffprobe` is available, cached videos are also validated for a real video stream and positive duration
+
+Sarvam OCR behavior:
+
+- `--sarvam` uses Sarvam Vision for OCR and a Sarvam chat model for cleanup
+- Model selection is automatic by default: `sarvam-30b` for image/carousel cleanup and `sarvam-105b` for reels/videos
+- You can override cleanup selection with `--sarvam-model sarvam-30b` or `--sarvam-model sarvam-105b`
 
 ## Testing
 

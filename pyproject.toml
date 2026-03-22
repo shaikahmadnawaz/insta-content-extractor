@@ -10,4 +10,5 @@ dependencies = [
     "pytesseract>=0.3.13",
     "requests>=2.32.0",
     "rich>=14.3.3",
+    "sarvamai",
 ]
