@@ -50,6 +50,36 @@ The extraction flow is:
 - OCR text for slides and reel scenes
 - Accessibility caption from Instagram when explicitly requested
 
+## Content Source Handling
+
+Instagram content is not always text-on-image first.
+
+In practice:
+- sometimes the media is only representational and the real message is in the caption
+- sometimes the caption is promotional and the real message is inside the slides or reel frames
+- sometimes both sources matter
+
+To handle that, the extractor does not merge caption and OCR blindly.
+
+Instead it keeps them separate and adds a lightweight content decision layer:
+- `content_strategy`
+- `primary_source`
+- `primary_text`
+
+Current strategy values:
+- `caption_only`
+- `ocr_only`
+- `caption_plus_ocr`
+- `media_representational`
+- `none`
+
+How it behaves:
+- if caption is substantial and OCR is weak, it prefers the caption
+- if OCR is substantial and caption is weak or mostly promotional, it prefers OCR
+- if both are meaningful, it keeps both and marks the result as `caption_plus_ocr`
+
+This keeps the raw data intact while still giving downstream users a practical default.
+
 ## Supported OCR Modes
 
 ### `--local`
@@ -316,6 +346,9 @@ The saved JSON includes:
 - `ocr_combined_text`
 - `ocr_provider`
 - `ocr_cleanup_model` when applicable
+- `content_strategy`
+- `primary_source`
+- `primary_text`
 - `ocr_text_file` when OCR is enabled
 - `json_file` when JSON output is enabled
 
