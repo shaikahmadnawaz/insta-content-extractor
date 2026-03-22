@@ -393,6 +393,12 @@ downloads/instagram/reels/DTTBJSgE6pP/content/DTTBJSgE6pP.sarvam.ocr.txt
 
 ### Example YouTube Short
 
+Input:
+
+<p>
+  <img src="assets/short.png" width="280" alt="YouTube Short example" />
+</p>
+
 Input URL:
 
 ```text
