@@ -1,11 +1,15 @@
 """
-Instagram Content Extractor - Core Module
+Social Content Extractor - Core Module
 
-Extracts content from Instagram posts (single & carousel):
-- Caption, hashtags, mentions
+Extracts content from:
+- Instagram posts and reels
+- YouTube Shorts
+
+Shared capabilities:
+- Text metadata (caption/description, hashtags, mentions)
 - Media URLs with optional local download
 - Post metadata (date, likes, comments, owner)
-- OCR text extraction from image slides
+- OCR text extraction from image slides or video scenes
 """
 
 from __future__ import annotations
@@ -17,209 +21,69 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 import unicodedata
 import zipfile
 from difflib import SequenceMatcher
 from io import BytesIO
-from urllib.parse import urlparse
 
-import instaloader
 import pytesseract
 import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pytesseract import Output
 
-DEFAULT_OCR_LANG = "eng"
-DEFAULT_OCR_PSM = 6
-DEFAULT_OCR_MIN_CONFIDENCE = 30.0
-DEFAULT_FETCH_ATTEMPTS = 3
-DEFAULT_VIDEO_FRAME_INTERVAL_SECONDS = 1.0
-SHORT_VIDEO_FRAME_INTERVAL_SECONDS = 0.5
-SHORT_VIDEO_DURATION_THRESHOLD_SECONDS = 15.0
-SCENE_SIMILARITY_THRESHOLD = 0.9
-MIN_SCENE_CONFIDENCE = 60.0
-MIN_SCENE_MEANINGFUL_TOKENS = 4
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/133.0.0.0 Safari/537.36"
-    )
-}
-
-
-def _read_env_file(env_path: str = ".env") -> dict[str, str]:
-    """Read simple KEY=VALUE pairs from a local .env file."""
-    if not os.path.exists(env_path):
-        return {}
-
-    values: dict[str, str] = {}
-    with open(env_path, "r", encoding="utf-8") as file_obj:
-        for raw_line in file_obj:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip().strip("'\"")
-    return values
-
-
-def _get_env_value(name: str, env_path: str = ".env") -> str | None:
-    """Get an environment variable, falling back to the project's .env file."""
-    value = os.environ.get(name)
-    if value:
-        return value
-    return _read_env_file(env_path).get(name)
-
-
-def _extract_instagram_url_parts(url: str) -> tuple[str, str]:
-    """Extract the Instagram media kind and shortcode from a supported URL."""
-    path = urlparse(url).path.strip("/")
-    match = re.match(r"(?P<kind>p|reel|tv)/(?P<shortcode>[A-Za-z0-9_-]+)", path)
-    if match:
-        return match.group("kind"), match.group("shortcode")
-    raise ValueError(
-        f"Could not extract shortcode from URL: {url}\n"
-        "Expected: https://www.instagram.com/p/SHORTCODE/ "
-        "or /reel/SHORTCODE/ or /tv/SHORTCODE/"
-    )
-
-
-def extract_shortcode(url: str) -> str:
-    """Extract the shortcode from an Instagram post URL."""
-    _, shortcode = _extract_instagram_url_parts(url)
-    return shortcode
-
-
-def _build_canonical_instagram_url(kind: str, shortcode: str) -> str:
-    """Return a canonical Instagram URL for the detected media type."""
-    return f"https://www.instagram.com/{kind}/{shortcode}/"
-
-
-def _build_output_artifact_stem(shortcode: str, ocr_provider: str | None) -> str:
-    """Build a mode-aware artifact stem so OCR runs can coexist side by side."""
-    if not ocr_provider:
-        return shortcode
-
-    suffix_map = {
-        "tesseract": "local",
-        "sarvam": "sarvam",
-        "sarvam_vision": "sarvam-vision",
-    }
-    suffix = suffix_map.get(ocr_provider)
-    if not suffix:
-        return shortcode
-    return f"{shortcode}.{suffix}"
-
-
-def _output_collection_for_kind(kind: str) -> str:
-    """Map Instagram URL kinds to top-level output buckets."""
-    return "reels" if kind == "reel" else "posts"
-
-
-def _select_primary_content(caption: str, ocr_text: str) -> dict[str, str]:
-    """Choose the most useful primary text while keeping caption and OCR separate."""
-    caption_clean = caption.strip()
-    ocr_clean = ocr_text.strip()
-
-    if not caption_clean and not ocr_clean:
-        return {
-            "content_strategy": "none",
-            "primary_source": "none",
-            "primary_text": "",
-        }
-    if caption_clean and not ocr_clean:
-        return {
-            "content_strategy": "caption_only",
-            "primary_source": "caption",
-            "primary_text": caption_clean,
-        }
-    if ocr_clean and not caption_clean:
-        return {
-            "content_strategy": "ocr_only",
-            "primary_source": "ocr",
-            "primary_text": ocr_clean,
-        }
-
-    caption_word_count = _count_meaningful_words(caption_clean)
-    ocr_word_count = _count_meaningful_words(ocr_clean)
-    caption_substantive = caption_word_count >= 12
-    ocr_substantive = ocr_word_count >= 12
-    caption_promo_markers = _promotional_marker_count(caption_clean)
-
-    if caption_substantive and not ocr_substantive:
-        if caption_promo_markers >= 2 and ocr_word_count >= 6:
-            return {
-                "content_strategy": "caption_plus_ocr",
-                "primary_source": "ocr",
-                "primary_text": ocr_clean,
-            }
-        return {
-            "content_strategy": "media_representational",
-            "primary_source": "caption",
-            "primary_text": caption_clean,
-        }
-    if ocr_substantive and not caption_substantive:
-        return {
-            "content_strategy": "ocr_only",
-            "primary_source": "ocr",
-            "primary_text": ocr_clean,
-        }
-
-    if caption_substantive and ocr_substantive:
-        primary_source = _choose_primary_source(caption_clean, ocr_clean)
-        return {
-            "content_strategy": "caption_plus_ocr",
-            "primary_source": primary_source,
-            "primary_text": caption_clean if primary_source == "caption" else ocr_clean,
-        }
-
-    primary_source = "caption" if caption_word_count >= ocr_word_count else "ocr"
-    return {
-        "content_strategy": "caption_plus_ocr",
-        "primary_source": primary_source,
-        "primary_text": caption_clean if primary_source == "caption" else ocr_clean,
-    }
-
-
-def _count_meaningful_words(text: str) -> int:
-    """Count readable words for simple content-source heuristics."""
-    return len(re.findall(r"[A-Za-z0-9]{2,}", text))
-
-
-def _choose_primary_source(caption: str, ocr_text: str) -> str:
-    """Prefer the richer, less promotional source when both caption and OCR matter."""
-    caption_score = _content_source_score(caption)
-    ocr_score = _content_source_score(ocr_text)
-    return "caption" if caption_score >= ocr_score else "ocr"
-
-
-def _content_source_score(text: str) -> int:
-    """Score a text source by substance minus obvious promotional language."""
-    word_count = _count_meaningful_words(text)
-    promo_penalty = 8 * _promotional_marker_count(text)
-    return word_count - promo_penalty
-
-
-def _promotional_marker_count(text: str) -> int:
-    """Detect generic CTA/promotional language often found in Instagram captions."""
-    lowered = text.lower()
-    markers = [
-        "follow",
-        "like",
-        "share",
-        "save this",
-        "save this post",
-        "comment",
-        "dm ",
-        "link in bio",
-        "for more",
-        "course",
-        "subscribe",
-    ]
-    return sum(marker in lowered for marker in markers)
-
+from .constants import (
+    DEFAULT_OCR_LANG,
+    DEFAULT_OCR_MIN_CONFIDENCE,
+    DEFAULT_OCR_PSM,
+    DEFAULT_VIDEO_FRAME_INTERVAL_SECONDS,
+    MIN_SCENE_CONFIDENCE,
+    MIN_SCENE_MEANINGFUL_TOKENS,
+    REQUEST_HEADERS,
+    SCENE_SIMILARITY_THRESHOLD,
+    SCENE_TOKEN_OVERLAP_THRESHOLD,
+    SHORT_VIDEO_DURATION_THRESHOLD_SECONDS,
+    SHORT_VIDEO_FRAME_INTERVAL_SECONDS,
+)
+from .sources import (
+    _build_content_output_dir,
+    _build_media_output_dir,
+    _build_post_output_dir,
+    _build_slides,
+    _build_youtube_caption,
+    _collect_media,
+    _collect_youtube_media,
+    _create_loader,
+    _create_youtube_downloader,
+    _download_media,
+    _download_youtube_media,
+    _fetch_post,
+    _fetch_youtube_video_info,
+    _get_post_type,
+    _get_youtube_owner_username,
+    _get_youtube_upload_iso_datetime,
+    _is_valid_cached_media,
+    _is_valid_video_file,
+    _remove_invalid_cached_file,
+)
+from .text import (
+    _build_canonical_instagram_url,
+    _build_canonical_youtube_url,
+    _build_output_artifact_stem,
+    _count_meaningful_words,
+    _choose_primary_source,
+    _content_source_score,
+    _extract_hashtags,
+    _extract_instagram_url_parts,
+    _extract_mentions,
+    _extract_supported_url_parts,
+    _extract_youtube_url_parts,
+    _get_env_value,
+    _output_collection_for_kind,
+    _promotional_marker_count,
+    _read_env_file,
+    _select_primary_content,
+    extract_shortcode,
+)
 
 def extract_post(
     url: str,
@@ -234,8 +98,25 @@ def extract_post(
     sarvam_model: str = "auto",
     sarvam_language: str = "en-IN",
 ) -> dict:
-    """Extract all content from a public Instagram post."""
-    url_kind, shortcode = _extract_instagram_url_parts(url)
+    """Extract all content from a supported public social media URL."""
+    platform, url_kind, content_id = _extract_supported_url_parts(url)
+    if platform == "youtube":
+        return _extract_youtube_short(
+            url=url,
+            video_id=content_id,
+            download_media=download_media,
+            output_dir=output_dir,
+            ocr=ocr,
+            save_json=save_json,
+            ocr_provider=ocr_provider,
+            ocr_lang=ocr_lang,
+            ocr_psm=ocr_psm,
+            ocr_min_confidence=ocr_min_confidence,
+            sarvam_model=sarvam_model,
+            sarvam_language=sarvam_language,
+        )
+
+    shortcode = content_id
     post_output_dir = _build_post_output_dir(output_dir, url_kind, shortcode)
     media_output_dir = _build_media_output_dir(post_output_dir)
     content_output_dir = _build_content_output_dir(post_output_dir)
@@ -287,7 +168,9 @@ def extract_post(
     content_selection = _select_primary_content(post.caption or "", ocr_combined_text)
 
     post_data = {
+        "platform": "instagram",
         "shortcode": shortcode,
+        "content_id": shortcode,
         "url": _build_canonical_instagram_url(url_kind, shortcode),
         "post_type": _get_post_type(post),
         "owner": {
@@ -336,206 +219,122 @@ def extract_post(
     return post_data
 
 
-def _create_loader() -> instaloader.Instaloader:
-    """Create an Instaloader instance with download disabled."""
-    return instaloader.Instaloader(
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False,
-        post_metadata_txt_pattern="",
-        max_connection_attempts=3,
-    )
-
-
-def _fetch_post(
-    loader: instaloader.Instaloader,
-    shortcode: str,
-    max_attempts: int = DEFAULT_FETCH_ATTEMPTS,
-) -> instaloader.Post:
-    """Fetch a post with small backoff to smooth over transient Instagram failures."""
-    last_error: Exception | None = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return instaloader.Post.from_shortcode(loader.context, shortcode)
-        except Exception as exc:
-            last_error = exc
-            if attempt == max_attempts:
-                break
-            time.sleep(attempt)
-
-    assert last_error is not None
-    raise last_error
-
-
-def _get_post_type(post) -> str:
-    """Return a human-readable post type string."""
-    if post.typename == "GraphSidecar":
-        return "carousel"
-    return "video" if post.is_video else "image"
-
-
-def _build_post_output_dir(base_output_dir: str, kind: str, shortcode: str) -> str:
-    """Return the dedicated output directory for one Instagram post."""
-    return os.path.join(base_output_dir, _output_collection_for_kind(kind), shortcode)
-
-
-def _build_media_output_dir(post_output_dir: str) -> str:
-    """Return the media subdirectory for one Instagram post."""
-    return os.path.join(post_output_dir, "media")
-
-
-def _build_content_output_dir(post_output_dir: str) -> str:
-    """Return the content subdirectory for one Instagram post."""
-    return os.path.join(post_output_dir, "content")
-
-
-def _collect_media(post) -> list[dict]:
-    """Collect all media items from a post."""
-    items = []
-
-    if post.typename == "GraphSidecar":
-        for idx, node in enumerate(post.get_sidecar_nodes(), start=1):
-            entry = {
-                "index": idx,
-                "type": "video" if node.is_video else "image",
-                "url": node.video_url if node.is_video else node.display_url,
-            }
-            if node.is_video:
-                entry["thumbnail_url"] = node.display_url
-            items.append(entry)
-        return items
-
-    entry = {
-        "index": 1,
-        "type": "video" if post.is_video else "image",
-        "url": post.video_url if post.is_video else post.url,
-    }
-    if post.is_video:
-        entry["thumbnail_url"] = post.url
-    items.append(entry)
-    return items
-
-
-def _build_slides(media_items: list[dict], download_map: dict[int, str]) -> list[dict]:
-    """Build per-slide records to make downstream consumption easier."""
-    slides = []
-    for item in media_items:
-        slide = dict(item)
-        slide["file_path"] = download_map.get(item["index"])
-        slides.append(slide)
-    return slides
-
-
-def _download_media(
-    loader: instaloader.Instaloader,
-    media_items: list[dict],
-    shortcode: str,
+def _extract_youtube_short(
+    url: str,
+    video_id: str,
+    download_media: bool,
     output_dir: str,
-) -> dict[int, str]:
-    """Download all media files and return a map of slide index -> file path."""
-    os.makedirs(output_dir, exist_ok=True)
-    downloaded: dict[int, str] = {}
+    ocr: bool,
+    save_json: bool,
+    ocr_provider: str,
+    ocr_lang: str,
+    ocr_psm: int,
+    ocr_min_confidence: float,
+    sarvam_model: str,
+    sarvam_language: str,
+) -> dict:
+    """Extract metadata, media, and OCR text from a YouTube Short."""
+    post_output_dir = _build_post_output_dir(output_dir, "shorts", video_id, source="youtube")
+    media_output_dir = _build_media_output_dir(post_output_dir)
+    content_output_dir = _build_content_output_dir(post_output_dir)
+    info = _fetch_youtube_video_info(url)
 
-    for item in media_items:
-        ext = "mp4" if item["type"] == "video" else "jpg"
-        filename = f"{shortcode}_{item['index']}.{ext}"
-        filepath = os.path.join(output_dir, filename)
+    media_items = _collect_youtube_media(info)
+    download_map: dict[int, str] = {}
+    if download_media:
+        download_map = _download_youtube_media(url, video_id, media_output_dir)
 
-        if _is_valid_cached_media(item, filepath):
-            downloaded[item["index"]] = filepath
-            continue
+    slides = _build_slides(media_items, download_map)
+    ocr_results: list[dict] = []
+    resolved_sarvam_model: str | None = None
+    if ocr:
+        if ocr_provider == "sarvam":
+            _ensure_tesseract_available()
+            if any(slide["type"] == "video" for slide in slides):
+                _ensure_ffmpeg_available()
+            ocr_results, resolved_sarvam_model = _ocr_images_with_sarvam(
+                slides=slides,
+                requested_chat_model=sarvam_model,
+                ocr_lang=ocr_lang,
+                ocr_psm=ocr_psm,
+                ocr_min_confidence=ocr_min_confidence,
+            )
+        elif ocr_provider == "sarvam_vision":
+            if any(slide["type"] == "video" for slide in slides):
+                _ensure_ffmpeg_available()
+            ocr_results, resolved_sarvam_model = _ocr_images_with_sarvam_vision(
+                slides=slides,
+                output_dir=content_output_dir,
+                requested_chat_model=sarvam_model,
+                sarvam_language=sarvam_language,
+            )
+        else:
+            _ensure_tesseract_available()
+            if any(slide["type"] == "video" for slide in slides):
+                _ensure_ffmpeg_available()
+            ocr_results = _ocr_images(
+                slides=slides,
+                ocr_lang=ocr_lang,
+                ocr_psm=ocr_psm,
+                ocr_min_confidence=ocr_min_confidence,
+            )
+        _attach_ocr_results(slides, ocr_results)
 
-        _remove_invalid_cached_file(filepath)
+    caption = _build_youtube_caption(info)
+    ocr_combined_text = _combine_ocr_text(ocr_results)
+    content_selection = _select_primary_content(caption, ocr_combined_text)
 
-        try:
-            loader.context.get_and_write_raw(item["url"], filepath)
-            if _is_valid_cached_media(item, filepath):
-                downloaded[item["index"]] = filepath
-            else:
-                _remove_invalid_cached_file(filepath)
-                print(f"  Warning: Downloaded media #{item['index']} was invalid and was discarded")
-        except Exception as exc:
-            print(f"  Warning: Failed to download media #{item['index']}: {exc}")
+    post_data = {
+        "platform": "youtube",
+        "shortcode": video_id,
+        "content_id": video_id,
+        "url": _build_canonical_youtube_url(video_id),
+        "post_type": "video",
+        "title": (info.get("title") or "").strip(),
+        "owner": {
+            "username": _get_youtube_owner_username(info),
+            "user_id": info.get("channel_id") or info.get("uploader_id"),
+        },
+        "caption": caption,
+        "accessibility_caption": None,
+        "hashtags": _extract_hashtags(caption),
+        "mentions": _extract_mentions(caption),
+        "date": _get_youtube_upload_iso_datetime(info),
+        "date_local": None,
+        "likes": info.get("like_count") or 0,
+        "comments_count": info.get("comment_count") or 0,
+        "media_count": len(media_items),
+        "media": media_items,
+        "slides": slides,
+        "downloaded_files": [download_map[idx] for idx in sorted(download_map)],
+        "ocr_text": ocr_results,
+        "ocr_combined_text": ocr_combined_text,
+        "ocr_provider": ocr_provider if ocr else None,
+        "content_strategy": content_selection["content_strategy"],
+        "primary_source": content_selection["primary_source"],
+        "primary_text": content_selection["primary_text"],
+    }
+    if resolved_sarvam_model:
+        post_data["ocr_cleanup_model"] = resolved_sarvam_model
 
-    return downloaded
+    os.makedirs(post_output_dir, exist_ok=True)
+    artifact_stem = _build_output_artifact_stem(video_id, post_data["ocr_provider"])
 
+    if ocr:
+        os.makedirs(content_output_dir, exist_ok=True)
+        txt_path = os.path.join(content_output_dir, f"{artifact_stem}.ocr.txt")
+        with open(txt_path, "w", encoding="utf-8") as file_obj:
+            file_obj.write(post_data["ocr_combined_text"])
+        post_data["ocr_text_file"] = txt_path
 
-def _is_valid_cached_media(item: dict, filepath: str) -> bool:
-    """Check whether an existing cached media file is safe to reuse."""
-    if not os.path.exists(filepath):
-        return False
-    if os.path.getsize(filepath) == 0:
-        return False
+    if save_json:
+        os.makedirs(content_output_dir, exist_ok=True)
+        json_path = os.path.join(content_output_dir, f"{artifact_stem}.json")
+        with open(json_path, "w", encoding="utf-8") as file_obj:
+            json.dump(post_data, file_obj, indent=2, ensure_ascii=False)
+        post_data["json_file"] = json_path
 
-    if item["type"] == "image":
-        try:
-            with Image.open(filepath) as image:
-                image.verify()
-            return True
-        except Exception:
-            return False
-
-    return _is_valid_video_file(filepath)
-
-
-def _is_valid_video_file(filepath: str) -> bool:
-    """Validate a cached video using MP4 signature checks and ffprobe when available."""
-    if os.path.getsize(filepath) < 1024:
-        return False
-
-    try:
-        with open(filepath, "rb") as file_obj:
-            header = file_obj.read(64)
-    except OSError:
-        return False
-
-    if b"ftyp" not in header:
-        return False
-
-    ffprobe_path = shutil.which("ffprobe")
-    if not ffprobe_path:
-        return True
-
-    command = [
-        ffprobe_path,
-        "-v",
-        "error",
-        "-print_format",
-        "json",
-        "-show_entries",
-        "format=duration:stream=codec_type",
-        filepath,
-    ]
-    try:
-        proc = subprocess.run(command, check=True, capture_output=True, text=True)
-        probe_data = json.loads(proc.stdout or "{}")
-    except (subprocess.SubprocessError, ValueError, json.JSONDecodeError):
-        return False
-
-    duration = probe_data.get("format", {}).get("duration")
-    try:
-        duration_seconds = float(duration)
-    except (TypeError, ValueError):
-        return False
-
-    streams = probe_data.get("streams", [])
-    has_video_stream = any(stream.get("codec_type") == "video" for stream in streams)
-    return duration_seconds > 0 and has_video_stream
-
-
-def _remove_invalid_cached_file(filepath: str) -> None:
-    """Delete a known-bad cache file if it exists."""
-    try:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-    except OSError:
-        pass
-
+    return post_data
 
 def _ensure_tesseract_available() -> None:
     """Raise a clear error if the local Tesseract binary is missing."""
@@ -1620,17 +1419,27 @@ def _scene_quality_score(scene: dict) -> float:
 def _deduplicate_scene_records(scene_records: list[dict]) -> list[dict]:
     """Deduplicate repeated OCR scenes and keep first appearance timestamp."""
     kept: list[dict] = []
-    normalized_history: list[str] = []
+    normalized_history: list[dict[str, object]] = []
 
     for scene in sorted(scene_records, key=lambda item: item.get("timestamp_seconds", 0.0)):
-        normalized = _normalize_scene_text(scene.get("text", ""))
-        if not normalized:
+        raw_text = scene.get("text", "")
+        normalized = _normalize_scene_text(raw_text)
+        tokens = _scene_similarity_tokens(raw_text)
+        if not normalized and not tokens:
             continue
 
-        if any(_texts_are_similar(normalized, seen) for seen in normalized_history):
+        if any(
+            _texts_are_similar(
+                normalized,
+                str(seen["text"]),
+                tokens,
+                set(seen["tokens"]),
+            )
+            for seen in normalized_history
+        ):
             continue
 
-        normalized_history.append(normalized)
+        normalized_history.append({"text": normalized, "tokens": tokens})
         cleaned = dict(scene)
         cleaned.pop("timestamp_seconds", None)
         kept.append(cleaned)
@@ -1645,13 +1454,45 @@ def _normalize_scene_text(text: str) -> str:
     return compact
 
 
-def _texts_are_similar(text_a: str, text_b: str) -> bool:
+def _scene_similarity_tokens(text: str) -> set[str]:
+    """Extract meaningful scene tokens so OCR noise does not block deduplication."""
+    normalized_tokens = {
+        token
+        for token in re.findall(r"[A-Za-z]{4,}", text.lower())
+        if re.search(r"[aeiou]", token)
+    }
+    acronym_tokens = {
+        token.lower()
+        for token in re.findall(r"\b[A-Z0-9]{2,8}\b", text)
+    }
+    return normalized_tokens | acronym_tokens
+
+
+def _token_overlap_ratio(tokens_a: set[str], tokens_b: set[str]) -> float:
+    """Measure overlap against the smaller token set to catch repeated static frames."""
+    if not tokens_a or not tokens_b:
+        return 0.0
+    shared = len(tokens_a & tokens_b)
+    return shared / min(len(tokens_a), len(tokens_b))
+
+
+def _texts_are_similar(
+    text_a: str,
+    text_b: str,
+    tokens_a: set[str] | None = None,
+    tokens_b: set[str] | None = None,
+) -> bool:
     """Compare normalized texts with a high similarity threshold."""
     if text_a == text_b:
         return True
     if not text_a or not text_b:
-        return False
-    return SequenceMatcher(None, text_a, text_b).ratio() >= SCENE_SIMILARITY_THRESHOLD
+        return _token_overlap_ratio(tokens_a or set(), tokens_b or set()) >= SCENE_TOKEN_OVERLAP_THRESHOLD
+
+    if SequenceMatcher(None, text_a, text_b).ratio() >= SCENE_SIMILARITY_THRESHOLD:
+        return True
+
+    overlap = _token_overlap_ratio(tokens_a or set(), tokens_b or set())
+    return overlap >= SCENE_TOKEN_OVERLAP_THRESHOLD
 
 
 def _format_seconds_timestamp(seconds: float) -> str:
