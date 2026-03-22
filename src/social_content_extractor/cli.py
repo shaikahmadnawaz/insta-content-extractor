@@ -1,4 +1,4 @@
-"""Instagram Content Extractor CLI."""
+"""Social Content Extractor CLI."""
 
 import argparse
 import json
@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from extractor import extract_post, extract_shortcode
+from .extractor import extract_post, extract_shortcode
 
 console = Console()
 
@@ -20,16 +20,19 @@ def display_results(
     show_json: bool = False,
     show_accessibility: bool = False,
 ) -> None:
-    """Display extracted post data in the terminal."""
+    """Display extracted content data in the terminal."""
     if show_json:
         console.print_json(json.dumps(data, default=str))
         return
+
+    platform = data.get("platform", "instagram")
+    header_title = "Social Content Extractor"
 
     # Header
     console.print()
     console.print(
         Panel(
-            f"[bold cyan]Instagram Content Extractor[/bold cyan]\n"
+            f"[bold cyan]{header_title}[/bold cyan]\n"
             f"[dim]{data['url']}[/dim]",
             box=box.DOUBLE,
             border_style="cyan",
@@ -47,7 +50,10 @@ def display_results(
     )
     info.add_column("Field", style="bold white", min_width=15)
     info.add_column("Value", style="white")
+    info.add_row("Platform", platform.capitalize())
     info.add_row("Owner", f"@{data['owner']['username']}")
+    if data.get("title"):
+        info.add_row("Title", data["title"])
     info.add_row("Type", data["post_type"].upper())
     info.add_row("Date (UTC)", data["date"])
     if data.get("date_local"):
@@ -57,7 +63,7 @@ def display_results(
     info.add_row("Media Count", str(data["media_count"]))
     console.print(info)
 
-    # Caption
+    # Caption / description
     if data["caption"]:
         caption = data["caption"]
         if len(caption) > 2000:
@@ -159,7 +165,7 @@ def display_results(
                 console.print(
                     Panel(
                         body,
-                        title=f"Slide {slide} - Reel OCR Scenes",
+                        title=f"Slide {slide} - Video OCR Scenes",
                         title_align="left",
                         border_style="bright_yellow",
                         box=box.ROUNDED,
@@ -186,19 +192,21 @@ def display_results(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract content from Instagram posts (single & carousel)",
+        description="Extract content from Instagram posts/reels and YouTube Shorts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            '  python main.py "https://www.instagram.com/p/SHORTCODE/"\n'
-            '  python main.py "https://www.instagram.com/p/SHORTCODE/" --local\n'
-            '  python main.py "https://www.instagram.com/p/SHORTCODE/" --sarvam\n'
-            '  python main.py "https://www.instagram.com/p/SHORTCODE/" --sarvam-vision\n'
-            '  python main.py "https://www.instagram.com/p/SHORTCODE/" --no-download\n'
-            '  python main.py "https://www.instagram.com/p/SHORTCODE/" --json\n'
+            '  social-content-extractor "https://www.instagram.com/p/SHORTCODE/"\n'
+            '  social-content-extractor "https://www.instagram.com/p/SHORTCODE/" --local\n'
+            '  social-content-extractor "https://www.instagram.com/reel/SHORTCODE/" --sarvam\n'
+            '  social-content-extractor "https://www.youtube.com/shorts/VIDEO_ID" --sarvam\n'
+            '  social-content-extractor "https://www.instagram.com/p/SHORTCODE/" --sarvam\n'
+            '  social-content-extractor "https://www.instagram.com/p/SHORTCODE/" --sarvam-vision\n'
+            '  social-content-extractor "https://www.instagram.com/p/SHORTCODE/" --no-download\n'
+            '  social-content-extractor "https://www.instagram.com/p/SHORTCODE/" --json\n'
         ),
     )
-    parser.add_argument("url", help="Instagram post URL")
+    parser.add_argument("url", help="Instagram post/reel URL or YouTube Shorts URL")
     parser.add_argument("--no-download", action="store_true",
                         help="Skip downloading media files")
     parser.add_argument("-o", "--output-dir", default="downloads",
@@ -276,7 +284,7 @@ def main() -> None:
         )
     except Exception as e:
         console.print(f"\n[bold red]Extraction failed:[/bold red] {e}")
-        console.print("[dim]If rate-limited, wait a few minutes and retry.[/dim]")
+        console.print("[dim]If the media is rate-limited, private, or temporarily unavailable, wait a bit and retry.[/dim]")
         sys.exit(1)
 
     display_results(
